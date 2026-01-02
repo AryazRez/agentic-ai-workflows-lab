@@ -1,0 +1,18 @@
+{
+  "pack_id": "evidence_pack_v1",
+  "description": "Local evidence pack for deterministic retrieval grounding in Variant 3.",
+  "sources": [
+    {
+      "source_id": "src_mcp_overview",
+      "title": "MCP overview and positioning notes",
+      "path": "docs/evidence_pack/sources/mcp_basics.md",
+      "topic_tags": ["mcp_basics"]
+    },
+    {
+      "source_id": "src_agent_failures_overview",
+      "title": "Common agentic AI failure modes overview",
+      "path": "docs/evidence_pack/sources/agent_failures.md",
+      "topic_tags": ["agent_failures"]
+    }
+  ]
+}
