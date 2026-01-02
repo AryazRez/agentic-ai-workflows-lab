@@ -53,12 +53,44 @@ def get_topic_question(topic: TopicSpec) -> str:
 # Evidence pack loading + retrieval
 # ----------------------------
 
+def validate_evidence_pack(pack: Dict, manifest_path: str) -> None:
+    sources = pack.get("sources", [])
+    if not sources:
+        raise RuntimeError(f"Evidence pack has no sources: {abs_path(manifest_path)}")
+
+    bad = []
+    for src in sources:
+        source_id = src.get("source_id", "<missing_source_id>")
+        rel_path = src.get("path")
+
+        if not rel_path:
+            bad.append({"source_id": source_id, "issue": "missing path"})
+            continue
+
+        ap = abs_path(rel_path)
+        if not os.path.exists(ap):
+            bad.append({"source_id": source_id, "issue": "file not found", "abs_path": ap})
+            continue
+
+        if os.path.getsize(ap) == 0:
+            bad.append({"source_id": source_id, "issue": "file is empty (0 bytes)", "abs_path": ap})
+
+    if bad:
+        raise RuntimeError(
+            "Evidence pack validation failed. Fix manifest paths or source files. "
+            f"manifest={abs_path(manifest_path)} bad_sources={bad}"
+        )
+
+
 def load_evidence_pack(manifest_path: str) -> Dict:
     manifest_abs = abs_path(manifest_path)
     if not os.path.exists(manifest_abs):
         raise FileNotFoundError(f"Evidence pack manifest not found: {manifest_abs}")
     with open(manifest_abs, "r", encoding="utf-8") as f:
-        return json.load(f)
+        pack = json.load(f)
+
+    validate_evidence_pack(pack, manifest_path)
+    return pack
 
 
 def validate_source_file(source_abs: str) -> Tuple[bool, str]:
