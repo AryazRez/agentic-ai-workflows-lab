@@ -100,30 +100,31 @@ This variant prioritizes transparency and control.
 
 ## Repository structure
 
+```
 agentic-ai-workflows-lab/
 ├── README.md
 ├── docs/
-│ ├── architecture.md
-│ ├── tradeoffs.md
-│ ├── failure_modes.md
-│ └── cost_and_latency.md
+│   ├── architecture.md
+│   ├── tradeoffs.md
+│   ├── failure_modes.md
+│   └── cost_and_latency.md
 ├── shared/
-│ ├── schemas.py
-│ ├── prompts.py
-│ └── utils.py
+│   ├── schemas.py
+│   ├── prompts.py
+│   └── utils.py
 ├── baseline_tool_calling/
-│ └── pipeline.py
+│   └── pipeline.py
 ├── mcp_orchestration/
-│ └── pipeline.py
+│   └── pipeline.py
 ├── minimal_custom_layer/
-│ └── pipeline.py
+│   └── pipeline.py
 ├── experiments/
-│ └── comparisons.ipynb
+│   └── comparisons.ipynb
 └── requirements.txt
-
-
+```
 
 Each orchestration variant produces functionally equivalent outputs to enable meaningful comparison.
+
 
 ---
 
