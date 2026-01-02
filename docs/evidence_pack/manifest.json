@@ -5,13 +5,13 @@
     {
       "source_id": "src_mcp_overview",
       "title": "MCP overview and positioning notes",
-      "path": "docs/evidence_pack/sources/mcp_basics.md",
+      "path": "docs/evidence_pack/sources/mcp_overview.md",
       "topic_tags": ["mcp_basics"]
     },
     {
       "source_id": "src_agent_failures_overview",
       "title": "Common agentic AI failure modes overview",
-      "path": "docs/evidence_pack/sources/agent_failures.md",
+      "path": "docs/evidence_pack/sources/agent_failures_overview.md",
       "topic_tags": ["agent_failures"]
     }
   ]

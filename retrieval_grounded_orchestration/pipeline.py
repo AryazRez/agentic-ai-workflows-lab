@@ -28,6 +28,10 @@ def abs_path(rel_or_abs: str) -> str:
     return os.path.join(repo_root(), rel_or_abs)
 
 
+def utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
 def get_topic_title(topic: TopicSpec) -> str:
     # Use whatever your schema provides, fall back to id
     if hasattr(topic, "title") and getattr(topic, "title"):
@@ -57,10 +61,45 @@ def load_evidence_pack(manifest_path: str) -> Dict:
         return json.load(f)
 
 
+def validate_source_file(source_abs: str) -> Tuple[bool, str]:
+    """
+    Returns (ok, reason). ok=False if file is missing, empty, or has no chunk headers.
+    """
+    if not os.path.exists(source_abs):
+        return False, f"Evidence source not found: {source_abs}"
+
+    try:
+        size = os.path.getsize(source_abs)
+    except OSError:
+        size = -1
+
+    if size == 0:
+        return False, f"Evidence source is empty (0 bytes): {source_abs}"
+
+    # Check for at least one chunk header to enforce the format contract
+    has_chunk_header = False
+    with open(source_abs, "r", encoding="utf-8") as f:
+        for line in f:
+            if CHUNK_HEADER_RE.match(line.strip()):
+                has_chunk_header = True
+                break
+
+    if not has_chunk_header:
+        return False, (
+            "Evidence source has content but no chunk headers. "
+            "Expected lines like '## Chunk c_001'. "
+            f"Source: {source_abs}"
+        )
+
+    return True, ""
+
+
 def load_source_chunks(source_path: str) -> List[Dict]:
     source_abs = abs_path(source_path)
-    if not os.path.exists(source_abs):
-        raise FileNotFoundError(f"Evidence source not found: {source_abs}")
+
+    ok, reason = validate_source_file(source_abs)
+    if not ok:
+        raise FileNotFoundError(reason)
 
     chunks: List[Dict] = []
     current_id = None
@@ -113,14 +152,24 @@ def retrieve_evidence_for_topic(
 
     query_terms = tokenize_query(query)
     candidates: List[Dict] = []
+    invalid_tagged_sources: List[Dict] = []
 
     for src in sources:
         if topic_id not in (src.get("topic_tags") or []):
             continue
 
-        source_id = src["source_id"]
-        source_path = src["path"]
+        source_id = src.get("source_id", "")
+        source_path = src.get("path", "")
         title = src.get("title", "")
+
+        # Validate and load chunks. If invalid, collect detail for a better error.
+        source_abs = abs_path(source_path)
+        ok, reason = validate_source_file(source_abs)
+        if not ok:
+            invalid_tagged_sources.append(
+                {"source_id": source_id, "abs_path": source_abs, "reason": reason}
+            )
+            continue
 
         chunks = load_source_chunks(source_path)
         for ch in chunks:
@@ -139,15 +188,18 @@ def retrieve_evidence_for_topic(
             )
 
     if not candidates:
+        detail = ""
+        if invalid_tagged_sources:
+            detail = f" Likely causes: Tagged sources exist but are invalid: {invalid_tagged_sources}"
         raise RuntimeError(
-            f"No evidence candidates found for topic_id='{topic_id}'. "
-            f"Check docs/evidence_pack/manifest.json topic_tags and source paths."
+            f"No evidence candidates found for topic_id='{topic_id}'."
+            f"{detail} Check docs/evidence_pack/manifest.json topic_tags and source paths."
         )
 
     candidates_sorted = sorted(candidates, key=lambda x: (-x["score"], x["source_id"], x["chunk_id"]))
     selected = candidates_sorted[: max(1, top_k)]
 
-    retrieved_at = datetime.now(timezone.utc).isoformat()
+    retrieved_at = utc_now_iso()
 
     evidence_json = {
         "topic_id": topic_id,
@@ -166,6 +218,7 @@ def retrieve_evidence_for_topic(
         "retrieved_at": retrieved_at,
         "pack_id": pack.get("pack_id", ""),
         "query_terms": query_terms,
+        "invalid_tagged_sources": invalid_tagged_sources,
         "candidates": [
             {
                 "source_id": c["source_id"],
@@ -225,8 +278,8 @@ Write in this structure:
 
 ## Risks and failure modes
 - 3 to 7 bullets
-- Include "Why:" per bullet
-- Cite chunks where possible
+- Each bullet must be: "Risk: ... Why: ... (c_###)"
+- If you cannot cite a risk, prefix the whole bullet with "Inference:" and do not pretend it is grounded
 
 ## Claims table
 | Claim | Confidence (High/Medium/Low) | Basis (Supported/Inference/Unverified) | Evidence |
@@ -334,7 +387,7 @@ def call_llm(model: str, prompt: str, temperature: float = 0.2) -> str:
             {"role": "user", "content": prompt},
         ],
     )
-    return resp.choices[0].message.content.strip()
+    return (resp.choices[0].message.content or "").strip()
 
 
 # ----------------------------
@@ -360,7 +413,7 @@ def run_pipeline(config_path: str = "inputs/run_config.json") -> None:
 
     manifest = {
         "run_id": run_id,
-        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "timestamp": utc_now_iso(),
         "model": model_name,
         "variant": "retrieval_grounded_local_pack",
         "topics_requested": len(config.topics),
@@ -391,7 +444,7 @@ def run_pipeline(config_path: str = "inputs/run_config.json") -> None:
         ensure_dir(topic_dir)
 
         try:
-            query = f"{get_topic_title(topic)} {get_topic_question(topic)}"
+            query = f"{topic.id} {get_topic_question(topic)}".strip()
 
             evidence_json, retrieval_trace_json = retrieve_evidence_for_topic(
                 topic_id=topic.id,
@@ -416,7 +469,13 @@ def run_pipeline(config_path: str = "inputs/run_config.json") -> None:
 
             write_json(
                 os.path.join(base_out, "tool_calls", f"{idx:03d}_generate_grounded_topic_notes_input.json"),
-                {"tool": "generate_grounded_topic_notes", "input": {"topic_id": topic.id, "selected_chunk_ids": [c["chunk_id"] for c in evidence_json["selected_chunks"]]}},
+                {
+                    "tool": "generate_grounded_topic_notes",
+                    "input": {
+                        "topic_id": topic.id,
+                        "selected_chunk_ids": [c["chunk_id"] for c in evidence_json["selected_chunks"]],
+                    },
+                },
             )
 
             notes = call_llm(model_name, prompt)
