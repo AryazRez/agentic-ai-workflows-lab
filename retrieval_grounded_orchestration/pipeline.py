@@ -3,591 +3,879 @@ from __future__ import annotations
 import json
 import os
 import re
-from dataclasses import asdict
-from datetime import datetime, timezone
-from typing import Dict, List, Tuple
-
-from openai import OpenAI
-
-from shared.schemas import TopicSpec, OutputConfig, RunConfig
-from shared.utils import ensure_dir, read_json, write_json, write_text
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
 
 
-CLIENT = OpenAI()
+# --------------------------------------------------------------------------------------
+# Paths and helpers
+# --------------------------------------------------------------------------------------
 
-CHUNK_HEADER_RE = re.compile(r"^##\s+Chunk\s+(?P<chunk_id>[a-zA-Z0-9_]+)\s*$", re.IGNORECASE)
-
-
-def repo_root() -> str:
-    return os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-
-
-def abs_path(rel_or_abs: str) -> str:
-    if os.path.isabs(rel_or_abs):
-        return rel_or_abs
-    return os.path.join(repo_root(), rel_or_abs)
+def repo_root() -> Path:
+    # Assumes this file lives at: <repo>/retrieval_grounded_orchestration/pipeline.py
+    return Path(__file__).resolve().parents[1]
 
 
-def utc_now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+def abs_path(*parts: str) -> Path:
+    return repo_root().joinpath(*parts).resolve()
 
 
-def get_topic_title(topic: TopicSpec) -> str:
-    # Use whatever your schema provides, fall back to id
-    if hasattr(topic, "title") and getattr(topic, "title"):
-        return getattr(topic, "title")
-    if hasattr(topic, "name") and getattr(topic, "name"):
-        return getattr(topic, "name")
-    return getattr(topic, "id", "topic")
+def ensure_dir(p: Path) -> None:
+    p.mkdir(parents=True, exist_ok=True)
 
 
-def get_topic_question(topic: TopicSpec) -> str:
-    # Prefer question, then prompt, then description, then empty string
-    for field in ["question", "prompt", "description"]:
-        if hasattr(topic, field) and getattr(topic, field):
-            return getattr(topic, field)
-    return ""
+def write_text(p: Path, s: str) -> None:
+    ensure_dir(p.parent)
+    p.write_text(s, encoding="utf-8")
 
 
-# ----------------------------
-# Evidence pack loading + retrieval
-# ----------------------------
-
-def validate_evidence_pack(pack: Dict, manifest_path: str) -> None:
-    sources = pack.get("sources", [])
-    if not sources:
-        raise RuntimeError(f"Evidence pack has no sources: {abs_path(manifest_path)}")
-
-    bad = []
-    for src in sources:
-        source_id = src.get("source_id", "<missing_source_id>")
-        rel_path = src.get("path")
-
-        if not rel_path:
-            bad.append({"source_id": source_id, "issue": "missing path"})
-            continue
-
-        ap = abs_path(rel_path)
-        if not os.path.exists(ap):
-            bad.append({"source_id": source_id, "issue": "file not found", "abs_path": ap})
-            continue
-
-        if os.path.getsize(ap) == 0:
-            bad.append({"source_id": source_id, "issue": "file is empty (0 bytes)", "abs_path": ap})
-
-    if bad:
-        raise RuntimeError(
-            "Evidence pack validation failed. Fix manifest paths or source files. "
-            f"manifest={abs_path(manifest_path)} bad_sources={bad}"
-        )
+def read_text(p: Path) -> str:
+    return p.read_text(encoding="utf-8")
 
 
-def load_evidence_pack(manifest_path: str) -> Dict:
-    manifest_abs = abs_path(manifest_path)
-    if not os.path.exists(manifest_abs):
-        raise FileNotFoundError(f"Evidence pack manifest not found: {manifest_abs}")
-    with open(manifest_abs, "r", encoding="utf-8") as f:
-        pack = json.load(f)
-
-    validate_evidence_pack(pack, manifest_path)
-    return pack
+def write_json(p: Path, obj: Any) -> None:
+    ensure_dir(p.parent)
+    p.write_text(json.dumps(obj, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
-def validate_source_file(source_abs: str) -> Tuple[bool, str]:
+def read_json(p: Path) -> Any:
+    return json.loads(read_text(p))
+
+
+# --------------------------------------------------------------------------------------
+# Config
+# --------------------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class PipelineConfig:
+    evidence_pack_manifest_relpath: str = "docs/evidence_pack/manifest.json"
+    outputs_dir_relpath: str = "outputs"
+
+    # "strict": fail topic on grounding validation failure
+    # "soft": prefix offending bullets with "Unverified:" and continue
+    grounding_mode: str = "strict"
+
+    # If True, pipeline will stop after topic generation if zero topics complete
+    halt_if_no_topics_completed: bool = True
+
+
+# --------------------------------------------------------------------------------------
+# Evidence pack validation
+# --------------------------------------------------------------------------------------
+
+def validate_source_file(source_file: Path) -> None:
+    if not source_file.exists():
+        raise FileNotFoundError(f"Evidence pack source file not found: {source_file}")
+    if not source_file.is_file():
+        raise ValueError(f"Evidence pack source path is not a file: {source_file}")
+    if source_file.stat().st_size == 0:
+        raise ValueError(f"Evidence pack source file is empty: {source_file}")
+
+
+def validate_evidence_pack(manifest_path: Path) -> Dict[str, Any]:
+    if not manifest_path.exists():
+        raise FileNotFoundError(f"Evidence pack manifest not found: {manifest_path}")
+
+    manifest = read_json(manifest_path)
+    if "sources" not in manifest or not isinstance(manifest["sources"], list):
+        raise ValueError("Evidence pack manifest must have a 'sources' list")
+
+    for src in manifest["sources"]:
+        if not isinstance(src, dict):
+            raise ValueError("Each source entry must be an object")
+        if "path" not in src:
+            raise ValueError("Each source entry must contain 'path'")
+        source_path = abs_path(src["path"])
+        validate_source_file(source_path)
+
+    return manifest
+
+
+# --------------------------------------------------------------------------------------
+# Chunking + retrieval
+# --------------------------------------------------------------------------------------
+
+# Accept citations in either form:
+#   (c_001) or (c_0001) or bare c_001 / c_0001
+# We capture the digits only.
+_CITATION_DIGITS_RE = re.compile(r"(?:\(\s*)?\bc_(\d{3,6})\b(?:\s*\))?")
+
+# Used to normalize bare citations to parenthesized form for output consistency.
+_BARE_CIT_RE = re.compile(r"(?<!\()\bc_\d{3,6}\b(?!\))")
+
+# Remove internal chunk headers embedded in evidence sources, e.g. "## Chunk c_102"
+_INTERNAL_CHUNK_HEADER_RE = re.compile(r"^\s*##\s*Chunk\s+c_\d{1,6}\s*$", re.IGNORECASE)
+
+
+def _clean_chunk_content(s: str) -> str:
+    lines = s.splitlines()
+    lines = [ln for ln in lines if not _INTERNAL_CHUNK_HEADER_RE.match(ln.strip())]
+    return "\n".join(lines).strip()
+
+
+def _chunk_markdown_to_chunks(md_text: str, chunk_prefix: str = "c_") -> List[Dict[str, Any]]:
     """
-    Returns (ok, reason). ok=False if file is missing, empty, or has no chunk headers.
+    Very simple chunker that splits on blank lines.
+    Each chunk is a dict with chunk_id and content.
     """
-    if not os.path.exists(source_abs):
-        return False, f"Evidence source not found: {source_abs}"
-
-    try:
-        size = os.path.getsize(source_abs)
-    except OSError:
-        size = -1
-
-    if size == 0:
-        return False, f"Evidence source is empty (0 bytes): {source_abs}"
-
-    # Check for at least one chunk header to enforce the format contract
-    has_chunk_header = False
-    with open(source_abs, "r", encoding="utf-8") as f:
-        for line in f:
-            if CHUNK_HEADER_RE.match(line.strip()):
-                has_chunk_header = True
-                break
-
-    if not has_chunk_header:
-        return False, (
-            "Evidence source has content but no chunk headers. "
-            "Expected lines like '## Chunk c_001'. "
-            f"Source: {source_abs}"
-        )
-
-    return True, ""
-
-
-def load_source_chunks(source_path: str) -> List[Dict]:
-    source_abs = abs_path(source_path)
-
-    ok, reason = validate_source_file(source_abs)
-    if not ok:
-        raise FileNotFoundError(reason)
-
-    chunks: List[Dict] = []
-    current_id = None
-    current_lines: List[str] = []
-
-    with open(source_abs, "r", encoding="utf-8") as f:
-        for line in f:
-            stripped = line.rstrip("\n")
-            m = CHUNK_HEADER_RE.match(stripped.strip())
-            if m:
-                if current_id is not None:
-                    text = "\n".join(current_lines).strip()
-                    if text:
-                        chunks.append({"chunk_id": current_id, "text": text})
-                current_id = m.group("chunk_id")
-                current_lines = []
-            else:
-                if current_id is not None:
-                    current_lines.append(stripped)
-
-    if current_id is not None:
-        text = "\n".join(current_lines).strip()
-        if text:
-            chunks.append({"chunk_id": current_id, "text": text})
-
+    blocks = [b.strip() for b in md_text.split("\n\n") if b.strip()]
+    chunks: List[Dict[str, Any]] = []
+    for i, block in enumerate(blocks, start=1):
+        chunk_id = f"{chunk_prefix}{i:03d}"
+        chunks.append({"chunk_id": chunk_id, "content": _clean_chunk_content(block)})
     return chunks
 
 
-def tokenize_query(query: str) -> List[str]:
-    tokens = re.findall(r"[a-zA-Z0-9_]+", (query or "").lower())
-    return [t for t in tokens if len(t) >= 3]
+def _safe_int(x: Any, default: int) -> int:
+    try:
+        return int(x)
+    except Exception:
+        return default
 
 
-def score_chunk(query_terms: List[str], chunk_text: str) -> int:
-    text = (chunk_text or "").lower()
-    score = 0
-    for term in query_terms:
-        score += text.count(term)
-    return score
+def _topic_max_chunks(topic: Dict[str, Any], default: int = 4) -> int:
+    """
+    Derive max_chunks from either:
+      - topic["max_chunks"] (legacy / direct)
+      - topic["constraints"]["max_sources"] (RunConfig schema)
+    """
+    if isinstance(topic.get("max_chunks"), (int, str)):
+        v = _safe_int(topic.get("max_chunks"), default)
+        return max(1, v)
+
+    constraints = topic.get("constraints")
+    if isinstance(constraints, dict) and "max_sources" in constraints:
+        v = _safe_int(constraints.get("max_sources"), default)
+        return max(1, v)
+
+    return max(1, default)
 
 
 def retrieve_evidence_for_topic(
     topic_id: str,
     query: str,
-    top_k: int,
-    manifest_path: str = "docs/evidence_pack/manifest.json",
-) -> Tuple[Dict, Dict]:
-    pack = load_evidence_pack(manifest_path)
-    sources = pack.get("sources", [])
+    manifest: Dict[str, Any],
+    max_chunks: int = 4
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """
+    Retrieves evidence for a topic using the local evidence pack.
 
-    query_terms = tokenize_query(query)
-    candidates: List[Dict] = []
-    invalid_tagged_sources: List[Dict] = []
+    Returns:
+      evidence_json: payload used for grounded prompting
+      retrieval_trace_json: includes selected_chunks [{source_id, chunk_id, title}]
+    """
+    sources = manifest.get("sources", [])
+    tagged_sources = []
+    invalid_tagged_sources = []
 
     for src in sources:
-        if topic_id not in (src.get("topic_tags") or []):
+        # Backwards compatible: manifest uses topic_tags, older schema used tags
+        tags = src.get("topic_tags", src.get("tags", []))
+        if topic_id in tags:
+            source_path = abs_path(src["path"])
+            try:
+                validate_source_file(source_path)
+                tagged_sources.append(src)
+            except Exception as e:
+                invalid_tagged_sources.append({"source": src, "error": str(e)})
+
+    selected_chunks: List[Dict[str, Any]] = []
+    evidence_items: List[Dict[str, Any]] = []
+    scoring_debug: List[Dict[str, Any]] = []
+
+    # Safety clamp
+    if max_chunks < 1:
+        max_chunks = 1
+
+    for src in tagged_sources:
+        source_id = src.get("source_id") or Path(src["path"]).stem
+        title = src.get("title") or source_id
+        source_path = abs_path(src["path"])
+        md_text = read_text(source_path)
+        chunks = _chunk_markdown_to_chunks(md_text)
+
+        if not chunks:
             continue
 
-        source_id = src.get("source_id", "")
-        source_path = src.get("path", "")
-        title = src.get("title", "")
-
-        # Validate and load chunks. If invalid, collect detail for a better error.
-        source_abs = abs_path(source_path)
-        ok, reason = validate_source_file(source_abs)
-        if not ok:
-            invalid_tagged_sources.append(
-                {"source_id": source_id, "abs_path": source_abs, "reason": reason}
-            )
-            continue
-
-        chunks = load_source_chunks(source_path)
+        # Naive scoring: prefer chunks containing any query tokens
+        q_tokens = [t for t in re.split(r"\W+", query.lower()) if t]
+        scored: List[Tuple[int, Dict[str, Any]]] = []
         for ch in chunks:
-            chunk_id = ch["chunk_id"]
-            text = ch["text"]
-            s = score_chunk(query_terms, text)
-            candidates.append(
+            text = (ch.get("content") or "").lower()
+            score = sum(1 for t in q_tokens if t in text)
+            scored.append((score, ch))
+
+        scored.sort(key=lambda x: x[0], reverse=True)
+
+        # Always include the first chunk (c_001) for a tagged source, then fill remaining slots by score.
+        first = chunks[0]
+        chosen: List[Dict[str, Any]] = [first]
+
+        first_id = first["chunk_id"]
+        for score, ch in scored:
+            if ch["chunk_id"] == first_id:
+                continue
+            if len(chosen) >= max_chunks:
+                break
+            chosen.append(ch)
+
+        # Debug record to explain why selection happened
+        debug_top = []
+        for score, ch in scored[: min(len(scored), 8)]:
+            debug_top.append({
+                "chunk_id": ch["chunk_id"],
+                "score": score,
+                "is_first": ch["chunk_id"] == first_id,
+            })
+
+        scoring_debug.append({
+            "source_id": source_id,
+            "title": title,
+            "path": src["path"],
+            "max_chunks": max_chunks,
+            "first_chunk_id": first_id,
+            "chosen_chunk_ids": [c["chunk_id"] for c in chosen],
+            "top_scored": debug_top,
+        })
+
+        for ch in chosen:
+            selected_chunks.append(
+                {"source_id": source_id, "chunk_id": ch["chunk_id"], "title": title}
+            )
+            evidence_items.append(
                 {
                     "source_id": source_id,
-                    "chunk_id": chunk_id,
-                    "score": s,
-                    "text": text,
-                    "path": source_path,
                     "title": title,
+                    "chunk_id": ch["chunk_id"],
+                    "content": ch.get("content") or "",
                 }
             )
-
-    if not candidates:
-        detail = ""
-        if invalid_tagged_sources:
-            detail = f" Likely causes: Tagged sources exist but are invalid: {invalid_tagged_sources}"
-        raise RuntimeError(
-            f"No evidence candidates found for topic_id='{topic_id}'."
-            f"{detail} Check docs/evidence_pack/manifest.json topic_tags and source paths."
-        )
-
-    candidates_sorted = sorted(candidates, key=lambda x: (-x["score"], x["source_id"], x["chunk_id"]))
-    selected = candidates_sorted[: max(1, top_k)]
-
-    retrieved_at = utc_now_iso()
 
     evidence_json = {
         "topic_id": topic_id,
         "query": query,
-        "retrieved_at": retrieved_at,
-        "pack_id": pack.get("pack_id", ""),
-        "selected_chunks": [
-            {"source_id": c["source_id"], "chunk_id": c["chunk_id"], "title": c["title"], "text": c["text"]}
-            for c in selected
-        ],
+        "retrieved_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "pack_id": manifest.get("pack_id", "evidence_pack_v1"),
+        "selected_chunks": selected_chunks,
+        "evidence_items": evidence_items,
     }
 
     retrieval_trace_json = {
         "topic_id": topic_id,
         "query": query,
-        "retrieved_at": retrieved_at,
-        "pack_id": pack.get("pack_id", ""),
-        "query_terms": query_terms,
+        "selected_chunks": selected_chunks,
         "invalid_tagged_sources": invalid_tagged_sources,
-        "candidates": [
-            {
-                "source_id": c["source_id"],
-                "chunk_id": c["chunk_id"],
-                "score": c["score"],
-                "title": c["title"],
-                "path": abs_path(c["path"]),
-            }
-            for c in candidates_sorted
-        ],
-        "selected": [{"source_id": c["source_id"], "chunk_id": c["chunk_id"], "score": c["score"]} for c in selected],
+        "scoring_debug": scoring_debug,
     }
 
     return evidence_json, retrieval_trace_json
 
 
-# ----------------------------
-# Prompts (grounded)
-# ----------------------------
+# --------------------------------------------------------------------------------------
+# Prompt builders
+# --------------------------------------------------------------------------------------
 
-def build_grounded_topic_prompt(topic: TopicSpec, evidence: Dict) -> str:
-    title = get_topic_title(topic)
-    question = get_topic_question(topic)
+def _extract_optional_prompt_hints(topic: Dict[str, Any]) -> Tuple[Optional[str], Optional[str]]:
+    audience = topic.get("audience")
+    if not isinstance(audience, str) or not audience.strip():
+        audience = None
 
-    chunks = evidence.get("selected_chunks", [])
-    formatted = []
-    for c in chunks:
-        formatted.append(f"[{c['chunk_id']}] {c['text']}")
-    evidence_block = "\n\n".join(formatted).strip()
+    tone = None
+    constraints = topic.get("constraints")
+    if isinstance(constraints, dict):
+        t = constraints.get("tone")
+        if isinstance(t, str) and t.strip():
+            tone = t.strip()
 
-    return f"""
-You are producing grounded research notes for a deterministic pipeline.
-
-Topic ID: {topic.id}
-Title: {title}
-Question: {question}
-
-Hard rules:
-- Use ONLY the evidence chunks provided below.
-- Do NOT add external facts.
-- Every factual claim must include at least one chunk citation in parentheses, e.g. (c_001).
-- If the evidence is insufficient, say so explicitly and mark claims as Unverified.
-
-Evidence chunks:
-{evidence_block}
-
-Write in this structure:
-
-## Key concepts (grounded)
-- 3 to 7 bullets
-- Each bullet must include citations like (c_001)
-
-## Practical implications (inferences allowed)
-- 3 to 7 bullets
-- If inference, prefix with "Inference:"
-- Still cite supporting chunks
-
-## Risks and failure modes
-- 3 to 7 bullets
-- Each bullet must be: "Risk: ... Why: ... (c_###)"
-- If you cannot cite a risk, prefix the whole bullet with "Inference:" and do not pretend it is grounded
-
-## Claims table
-| Claim | Confidence (High/Medium/Low) | Basis (Supported/Inference/Unverified) | Evidence |
-|---|---|---|---|
-| ... | ... | ... | c_001, c_003 |
-
-## Evidence gaps
-- 3 to 6 bullets listing what is missing from the evidence pack for this topic
-
-No links. No sources section. Output markdown only.
-""".strip()
+    return audience, tone
 
 
-def build_grounded_synthesis_prompt(topic_notes_by_id: Dict[str, str]) -> str:
+def build_grounded_topic_prompt(
+    topic_id: str,
+    query: str,
+    evidence_json: Dict[str, Any],
+    *,
+    audience: Optional[str] = None,
+    tone: Optional[str] = None,
+) -> str:
+    evidence_lines = []
+    allowed_ids: List[str] = []
+
+    for item in evidence_json.get("evidence_items", []):
+        cid = item["chunk_id"]
+        allowed_ids.append(cid)
+        evidence_lines.append(f"[{cid}] {item['title']}\n{item['content']}\n")
+
+    allowed_ids = sorted(set(allowed_ids))
+    allowed_str = ", ".join(allowed_ids) if allowed_ids else "(none)"
+    evidence_blob = "\n".join(evidence_lines).strip()
+
+    style_lines = []
+    if audience:
+        style_lines.append(f"Audience: {audience}")
+    if tone:
+        style_lines.append(f"Tone: {tone}")
+    style_block = ("\n".join(style_lines).strip() + "\n\n") if style_lines else ""
+
+    return (
+        f"You are writing research notes for topic_id={topic_id}.\n"
+        f"User query: {query}\n\n"
+        f"{style_block}"
+        "You MUST ground claims in the provided evidence.\n\n"
+        f"ALLOWED CITATIONS (use ONLY these exact ids): {allowed_str}\n\n"
+        "Hard rules you must follow exactly:\n"
+        "- Every bullet under '## Key concepts (grounded)' must include at least one citation.\n"
+        "- Citations must ONLY come from the allowed list above.\n"
+        "- Citations MUST be in parentheses, exactly like (c_002).\n"
+        "- If a bullet cannot be cited, REMOVE the bullet entirely.\n"
+        "- Do not invent facts or citations.\n"
+        "- Final self-check before output: every Key concepts bullet has a valid citation.\n\n"
+        "Write markdown with these sections:\n"
+        "# Research notes\n"
+        "## Key concepts (grounded)\n"
+        "- Each bullet must end with a valid citation like (c_002)\n"
+        "## Details\n"
+        "- Additional notes, with citations as needed\n\n"
+        "EVIDENCE:\n"
+        f"{evidence_blob}\n"
+    )
+
+
+def build_grounded_synthesis_prompt(completed_topics: List[Dict[str, Any]]) -> str:
     parts = []
-    for tid, notes in topic_notes_by_id.items():
-        parts.append(f"## Topic: {tid}\n{notes}")
-    all_notes = "\n\n".join(parts)
+    for t in completed_topics:
+        # Preserve topic boundaries explicitly to reduce blending.
+        parts.append(f"## Topic: {t['topic_id']}\n{t['research_notes_markdown']}\n")
+    joined = "\n".join(parts).strip()
 
-    return f"""
-You are synthesizing grounded notes from multiple topics.
-
-Hard rules:
-- Do NOT introduce new facts. Use only what is in the topic notes.
-- Preserve citations present in the notes.
-- If a statement has no citation available, label it "Unverified:".
-
-Input topic notes:
-{all_notes}
-
-Write the synthesis in this structure:
-
-## Per-topic takeaways
-For each topic:
-### <topic_id>
-- 3 to 6 bullets
-- Keep citations like (c_001)
-
-## Cross-topic synthesis
-- 5 to 9 bullets connecting topics
-- Reference topic ids in parentheses like (mcp_basics, agent_failures)
-- Keep citations where applicable
-
-## Risks and failure modes
-- 5 to 9 bullets
-- Keep citations where applicable
-
-## Open questions
-- 3 to 7 bullets describing what is missing and would require better evidence
-
-Output markdown only.
-""".strip()
-
-
-def build_short_form_prompt(platform: str, summary_text: str) -> str:
-    platform_norm = (platform or "").strip().lower()
-
-    if platform_norm == "linkedin":
-        style = """
-Write a LinkedIn post:
-- 120 to 220 words
-- Clear hook in the first 2 lines
-- Practical, non-hype tone
-- End with 1 question
-- Do not include links
-""".strip()
-    elif platform_norm == "youtube_shorts":
-        style = """
-Write a YouTube Shorts script:
-- 35 to 60 seconds
-- Tight pacing
-- Hook in first 2 seconds
-- Include 1 concrete example
-- No links
-""".strip()
-    else:
-        style = "Write a concise short-form draft. No links."
-
-    return f"""
-You are generating short-form content from a grounded summary.
-
-Hard rules:
-- Use ONLY the summary provided.
-- Do NOT add new facts.
-- Do NOT include links or sources.
-
-Platform: {platform}
-
-Style:
-{style}
-
-Summary:
-{summary_text}
-
-Output only the draft.
-""".strip()
-
-
-def call_llm(model: str, prompt: str, temperature: float = 0.2) -> str:
-    resp = CLIENT.chat.completions.create(
-        model=model,
-        temperature=temperature,
-        messages=[
-            {"role": "system", "content": "You are precise and follow grounding and formatting rules."},
-            {"role": "user", "content": prompt},
-        ],
-    )
-    return (resp.choices[0].message.content or "").strip()
-
-
-# ----------------------------
-# Pipeline
-# ----------------------------
-
-def run_pipeline(config_path: str = "inputs/run_config.json") -> None:
-    config_dict = read_json(config_path)
-    model_name = config_dict.get("model", "gpt-4o-mini")
-
-    topics = [TopicSpec(**t) for t in config_dict["topics"]]
-    output = OutputConfig(**config_dict["output"])
-
-    config = RunConfig(
-        run_id=config_dict["run_id"],
-        topics=topics,
-        output=output,
+    return (
+        "You are synthesizing multiple grounded topic notes into a single summary.\n"
+        "Do not invent facts. Do not add new claims that are not present in the topic notes.\n"
+        "Keep topic attribution clear where relevant.\n\n"
+        f"{joined}\n"
     )
 
-    run_id = config.run_id
-    base_out = os.path.join("outputs", run_id)
-    ensure_dir(base_out)
 
-    manifest = {
-        "run_id": run_id,
-        "timestamp": utc_now_iso(),
-        "model": model_name,
-        "variant": "retrieval_grounded_local_pack",
-        "topics_requested": len(config.topics),
-        "topics_completed": 0,
-        "call_count": 0,
-        "short_form_enabled": bool(config.output.short_form_platforms),
-        "short_form_platforms": config.output.short_form_platforms or [],
-        "errors": [],
-        "tools_available": [
-            "retrieve_evidence",
-            "generate_grounded_topic_notes",
-            "synthesize_grounded_notes",
-            "generate_short_form",
-        ],
-        "evidence_pack_manifest": abs_path("docs/evidence_pack/manifest.json"),
+def build_short_form_prompt(summary_markdown: str) -> str:
+    return (
+        "Rewrite the following summary into a short form, practical checklist.\n"
+        "Do not add new facts.\n\n"
+        f"{summary_markdown}\n"
+    )
+
+
+def build_grounding_retry_prompt(
+    topic_id: str,
+    query: str,
+    evidence_json: Dict[str, Any],
+    validation_errors: List[str],
+    previous_markdown: str,
+    *,
+    audience: Optional[str] = None,
+    tone: Optional[str] = None,
+) -> str:
+    evidence_lines = []
+    allowed_ids: List[str] = []
+
+    for item in evidence_json.get("evidence_items", []):
+        cid = item["chunk_id"]
+        allowed_ids.append(cid)
+        evidence_lines.append(f"[{cid}] {item['title']}\n{item['content']}\n")
+
+    allowed_ids = sorted(set(allowed_ids))
+    allowed_str = ", ".join(allowed_ids) if allowed_ids else "(none)"
+    evidence_blob = "\n".join(evidence_lines).strip()
+    error_block = "\n".join(f"- {e}" for e in validation_errors)
+
+    style_lines = []
+    if audience:
+        style_lines.append(f"Audience: {audience}")
+    if tone:
+        style_lines.append(f"Tone: {tone}")
+    style_block = ("\n".join(style_lines).strip() + "\n\n") if style_lines else ""
+
+    return (
+        f"You previously generated research notes for topic_id={topic_id}, but they FAILED grounding validation.\n\n"
+        "Grounding errors:\n"
+        f"{error_block}\n\n"
+        f"{style_block}"
+        f"ALLOWED CITATIONS (use ONLY these exact ids): {allowed_str}\n\n"
+        "Hard rules you must follow exactly:\n"
+        "- Every bullet under '## Key concepts (grounded)' must include at least one citation.\n"
+        "- Citations must ONLY reference the allowed citation ids.\n"
+        "- Citations MUST be in parentheses, exactly like (c_002).\n"
+        "- If a bullet cannot be cited, REMOVE the bullet entirely.\n"
+        "- Do not invent facts or citations.\n"
+        "- Final self-check before output: all Key concepts bullets are valid.\n\n"
+        "Here is your previous output for reference only:\n"
+        "-----\n"
+        f"{previous_markdown}\n"
+        "-----\n\n"
+        "Now regenerate the FULL research notes from scratch, fully corrected.\n\n"
+        "EVIDENCE:\n"
+        f"{evidence_blob}\n"
+    )
+
+
+# --------------------------------------------------------------------------------------
+# LLM call hook
+# --------------------------------------------------------------------------------------
+
+def call_llm(prompt: str, *, model: Optional[str] = None) -> str:
+    from openai import OpenAI
+
+    client = OpenAI()
+    m = model or os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
+
+    response = client.chat.completions.create(
+        model=m,
+        messages=[{"role": "user", "content": prompt}],
+    )
+
+    content = response.choices[0].message.content
+    if not isinstance(content, str) or not content.strip():
+        raise RuntimeError("Empty response content from model.")
+    return content
+
+
+# --------------------------------------------------------------------------------------
+# Post generation grounding validator + metrics
+# --------------------------------------------------------------------------------------
+
+_KEY_CONCEPTS_HEADER_RE = re.compile(r"^##\s+Key concepts\s+\(grounded\)\s*$", re.IGNORECASE)
+_ANY_HEADER_RE = re.compile(r"^##\s+.+$", re.IGNORECASE)
+_BULLET_RE = re.compile(r"^(\s*[-*]\s+)(.+)$")
+
+
+def _normalize_citations_to_parentheses(markdown: str) -> str:
+    return _BARE_CIT_RE.sub(lambda m: f"({m.group(0)})", markdown)
+
+
+def extract_citations(markdown: str) -> List[str]:
+    digits = _CITATION_DIGITS_RE.findall(markdown)
+    out: List[str] = []
+    for d in digits:
+        out.append(f"c_{int(d):03d}")
+    return out
+
+
+def _extract_key_concepts_section_lines(markdown: str) -> List[str]:
+    lines = markdown.splitlines()
+    start_idx = None
+    for i, line in enumerate(lines):
+        if _KEY_CONCEPTS_HEADER_RE.match(line.strip()):
+            start_idx = i + 1
+            break
+    if start_idx is None:
+        return []
+
+    section_lines: List[str] = []
+    for j in range(start_idx, len(lines)):
+        line = lines[j]
+        if _ANY_HEADER_RE.match(line.strip()):
+            break
+        section_lines.append(line)
+    return section_lines
+
+
+def _selected_chunk_ids_from_trace(retrieval_trace: Dict[str, Any]) -> List[str]:
+    ids: List[str] = []
+    for ch in retrieval_trace.get("selected_chunks", []):
+        cid = ch.get("chunk_id")
+        if isinstance(cid, str):
+            ids.append(cid)
+    return sorted(set(ids))
+
+
+def _extract_normalized_citations_from_line(line: str) -> List[str]:
+    digits = _CITATION_DIGITS_RE.findall(line)
+    return [f"c_{int(d):03d}" for d in digits]
+
+
+def _strip_invalid_citations(markdown: str, invalid_ids: List[str]) -> str:
+    if not invalid_ids:
+        return markdown
+    out = markdown
+    for bad in invalid_ids:
+        out = out.replace(f"({bad})", "")
+    return out
+
+
+def validate_and_optionally_rewrite_grounding(
+    research_notes_md: str,
+    selected_chunk_ids: List[str],
+    *,
+    grounding_mode: str
+) -> Tuple[bool, str, List[str], Dict[str, Any]]:
+    errors: List[str] = []
+    selected_set = set(selected_chunk_ids)
+
+    research_notes_md = _normalize_citations_to_parentheses(research_notes_md)
+
+    citations = extract_citations(research_notes_md)
+    invalid_citations = sorted({c for c in citations if c not in selected_set})
+    total_citations = len(citations)
+    invalid_citations_count = len(invalid_citations)
+
+    if invalid_citations:
+        errors.append(
+            "Invalid citations found (not in selected chunk_ids): "
+            + ", ".join(f"({c})" for c in invalid_citations)
+        )
+        research_notes_md = _strip_invalid_citations(research_notes_md, invalid_citations)
+
+    section_lines = _extract_key_concepts_section_lines(research_notes_md)
+    missing_key_concepts_section = len(section_lines) == 0
+    if missing_key_concepts_section:
+        errors.append("Missing section: ## Key concepts (grounded)")
+
+    lines = research_notes_md.splitlines()
+
+    key_concepts_bullets_total = 0
+    key_concepts_bullets_missing_valid_citation = 0
+
+    if not missing_key_concepts_section:
+        start_idx = None
+        for i, line in enumerate(lines):
+            if _KEY_CONCEPTS_HEADER_RE.match(line.strip()):
+                start_idx = i + 1
+                break
+
+        end_idx = len(lines)
+        if start_idx is not None:
+            for j in range(start_idx, len(lines)):
+                if _ANY_HEADER_RE.match(lines[j].strip()):
+                    end_idx = j
+                    break
+
+            rewritten_lines = list(lines)
+            for idx in range(start_idx, end_idx):
+                m = _BULLET_RE.match(lines[idx])
+                if not m:
+                    continue
+
+                key_concepts_bullets_total += 1
+
+                bullet_prefix = m.group(1)
+                bullet_text = m.group(2)
+
+                bullet_citations = _extract_normalized_citations_from_line(lines[idx])
+                valid_in_bullet = [c for c in bullet_citations if c in selected_set]
+
+                if len(valid_in_bullet) == 0:
+                    key_concepts_bullets_missing_valid_citation += 1
+                    msg = f"Uncited or invalidly cited bullet in Key concepts at line {idx + 1}"
+                    errors.append(msg)
+                    if grounding_mode == "soft":
+                        if not bullet_text.lstrip().startswith("Unverified:"):
+                            rewritten_lines[idx] = f"{bullet_prefix}Unverified: {bullet_text}"
+
+            research_notes_md = "\n".join(rewritten_lines)
+
+    ok = len(errors) == 0
+    if grounding_mode == "soft":
+        ok = True
+
+    metrics: Dict[str, Any] = {
+        "total_citations": total_citations,
+        "invalid_citations_count": invalid_citations_count,
+        "key_concepts_bullets_total": key_concepts_bullets_total,
+        "key_concepts_bullets_missing_valid_citation": key_concepts_bullets_missing_valid_citation,
+        "missing_key_concepts_section": missing_key_concepts_section,
     }
 
-    write_json(os.path.join(base_out, "run_config.json"), asdict(config))
-    ensure_dir(os.path.join(base_out, "topics"))
-    ensure_dir(os.path.join(base_out, "summary"))
-    ensure_dir(os.path.join(base_out, "short_form"))
-    ensure_dir(os.path.join(base_out, "tool_calls"))
+    return ok, research_notes_md, errors, metrics
 
-    topic_notes_by_id: Dict[str, str] = {}
 
-    for idx, topic in enumerate(config.topics, start=1):
-        topic_dir = os.path.join(base_out, "topics", topic.id)
-        ensure_dir(topic_dir)
+# --------------------------------------------------------------------------------------
+# Pipeline
+# --------------------------------------------------------------------------------------
+
+def run_pipeline(
+    run_id: Optional[str] = None,
+    *,
+    config: Optional[PipelineConfig] = None,
+    topics: Optional[List[Dict[str, Any]]] = None,
+    model: Optional[str] = None,
+    outputs_dir: Optional[Path] = None,
+) -> Dict[str, Any]:
+    cfg = config or PipelineConfig()
+    if cfg.grounding_mode not in ("strict", "soft"):
+        raise ValueError("grounding_mode must be 'strict' or 'soft'")
+
+    manifest_path = abs_path(cfg.evidence_pack_manifest_relpath)
+    manifest = validate_evidence_pack(manifest_path)
+
+    if run_id is None:
+        run_id = time.strftime("demo_v3_local_pack_%03d", time.localtime().tm_yday)
+
+    out_root = outputs_dir if outputs_dir is not None else abs_path(cfg.outputs_dir_relpath)
+    run_root = out_root / run_id
+    topics_dir = run_root / "topics"
+    summary_dir = run_root / "summary"
+    short_form_dir = run_root / "short_form"
+    tool_calls_dir = run_root / "tool_calls"
+
+    if run_root.exists():
+        suffix = 1
+        while (out_root / f"{run_id}_{suffix:02d}").exists():
+            suffix += 1
+        run_id = f"{run_id}_{suffix:02d}"
+        run_root = out_root / run_id
+        topics_dir = run_root / "topics"
+        summary_dir = run_root / "summary"
+        short_form_dir = run_root / "short_form"
+        tool_calls_dir = run_root / "tool_calls"
+
+    ensure_dir(topics_dir)
+    ensure_dir(summary_dir)
+    ensure_dir(short_form_dir)
+    ensure_dir(tool_calls_dir)
+
+    if topics is None:
+        tag_set = set()
+        for src in manifest.get("sources", []):
+            tags = src.get("topic_tags", src.get("tags", []))
+            for tag in tags:
+                if isinstance(tag, str) and tag.strip():
+                    tag_set.add(tag.strip())
+        derived = sorted(tag_set)
+        topics = [{"topic_id": t, "query": t} for t in derived]
+
+    resolved_model = model or os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
+
+    run_manifest: Dict[str, Any] = {
+        "run_id": run_id,
+        "variant": "retrieval_grounded_orchestration",
+        "model": resolved_model,
+        "started_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "topics_total": len(topics),
+        "topics_completed": 0,
+        "call_count": 0,
+        "errors": [],
+        "grounding_mode": cfg.grounding_mode,
+        "evidence_pack_manifest": str(Path(cfg.evidence_pack_manifest_relpath)),
+        "topics_input": [
+            {
+                "topic_id": t.get("topic_id"),
+                "query": t.get("query"),
+                "audience": t.get("audience"),
+                "constraints": t.get("constraints"),
+            }
+            for t in topics
+            if isinstance(t, dict)
+        ],
+    }
+
+    completed_topics_payload: List[Dict[str, Any]] = []
+    topic_statuses: Dict[str, Any] = {}
+
+    for t in topics:
+        topic_id = t["topic_id"]
+        query = t["query"]
+        topic_out_dir = topics_dir / topic_id
+        ensure_dir(topic_out_dir)
+
+        topic_statuses[topic_id] = {"status": "started", "errors": []}
+
+        audience, tone = _extract_optional_prompt_hints(t)
 
         try:
-            query = f"{topic.id} {get_topic_question(topic)}".strip()
+            max_chunks = _topic_max_chunks(t, default=4)
 
             evidence_json, retrieval_trace_json = retrieve_evidence_for_topic(
-                topic_id=topic.id,
+                topic_id=topic_id,
                 query=query,
-                top_k=3,
-                manifest_path="docs/evidence_pack/manifest.json",
+                manifest=manifest,
+                max_chunks=max_chunks,
             )
 
-            write_json(os.path.join(topic_dir, "evidence.json"), evidence_json)
-            write_json(os.path.join(topic_dir, "retrieval_trace.json"), retrieval_trace_json)
+            write_json(topic_out_dir / "evidence.json", evidence_json)
+            write_json(topic_out_dir / "retrieval_trace.json", retrieval_trace_json)
 
-            write_json(
-                os.path.join(base_out, "tool_calls", f"{idx:03d}_retrieve_evidence_input.json"),
-                {"tool": "retrieve_evidence", "input": {"topic_id": topic.id, "query": query, "top_k": 3}},
-            )
-            write_json(
-                os.path.join(base_out, "tool_calls", f"{idx:03d}_retrieve_evidence_output.json"),
-                {"tool": "retrieve_evidence", "output": {"topic_id": topic.id, "selected": evidence_json["selected_chunks"]}},
-            )
+            selected_chunk_ids = _selected_chunk_ids_from_trace(retrieval_trace_json)
 
-            prompt = build_grounded_topic_prompt(topic, evidence_json)
-
-            write_json(
-                os.path.join(base_out, "tool_calls", f"{idx:03d}_generate_grounded_topic_notes_input.json"),
-                {
-                    "tool": "generate_grounded_topic_notes",
-                    "input": {
-                        "topic_id": topic.id,
-                        "selected_chunk_ids": [c["chunk_id"] for c in evidence_json["selected_chunks"]],
+            if len(selected_chunk_ids) == 0:
+                msg = "No chunks selected for topic. Check evidence_pack manifest topic_tags for this topic_id."
+                write_text(topic_out_dir / "error.txt", msg + "\n")
+                topic_statuses[topic_id]["status"] = "failed"
+                topic_statuses[topic_id]["errors"].append(msg)
+                topic_statuses[topic_id]["attempts"] = 0
+                run_manifest["errors"].append({
+                    "topic_id": topic_id,
+                    "stage": "retrieval",
+                    "errors": [msg],
+                })
+                write_json(topic_out_dir / "grounding_validation.json", {
+                    "ok": False,
+                    "mode": cfg.grounding_mode,
+                    "attempts": 0,
+                    "selected_chunk_ids": selected_chunk_ids,
+                    "errors": [msg],
+                    "metrics": {
+                        "total_citations": 0,
+                        "invalid_citations_count": 0,
+                        "key_concepts_bullets_total": 0,
+                        "key_concepts_bullets_missing_valid_citation": 0,
+                        "missing_key_concepts_section": True,
                     },
-                },
-            )
+                })
+                continue
 
-            notes = call_llm(model_name, prompt)
-            manifest["call_count"] += 1
+            max_attempts = 3  # initial + up to two retries
+            research_notes_md: Optional[str] = None
+            ok = False
+            rewritten_md = ""
+            validation_errors: List[str] = []
+            validation_metrics: Dict[str, Any] = {}
 
-            write_text(os.path.join(topic_dir, "research_notes.md"), notes)
-            write_json(os.path.join(topic_dir, "prompt_trace.json"), {"prompt": prompt, "response": notes})
+            prompt_trace: Dict[str, Any] = {
+                "topic_id": topic_id,
+                "query": query,
+                "model": resolved_model,
+                "attempts": [],
+            }
 
-            write_json(
-                os.path.join(base_out, "tool_calls", f"{idx:03d}_generate_grounded_topic_notes_output.json"),
-                {"tool": "generate_grounded_topic_notes", "output": {"topic_id": topic.id, "notes_path": os.path.join(topic_dir, "research_notes.md")}},
-            )
+            attempts_used = 0
 
-            topic_notes_by_id[topic.id] = notes
-            manifest["topics_completed"] += 1
+            for attempt_index in range(max_attempts):
+                if attempt_index == 0:
+                    prompt = build_grounded_topic_prompt(
+                        topic_id, query, evidence_json, audience=audience, tone=tone
+                    )
+                else:
+                    prompt = build_grounding_retry_prompt(
+                        topic_id=topic_id,
+                        query=query,
+                        evidence_json=evidence_json,
+                        validation_errors=validation_errors,
+                        previous_markdown=research_notes_md or "",
+                        audience=audience,
+                        tone=tone,
+                    )
+
+                run_manifest["call_count"] += 1
+                research_notes_md = call_llm(prompt, model=resolved_model)
+                attempts_used = attempt_index + 1
+
+                ok, rewritten_md, validation_errors, validation_metrics = validate_and_optionally_rewrite_grounding(
+                    research_notes_md,
+                    selected_chunk_ids,
+                    grounding_mode=cfg.grounding_mode,
+                )
+
+                prompt_trace["attempts"].append({
+                    "attempt_index": attempt_index,
+                    "ok": ok,
+                    "prompt_chars": len(prompt),
+                    "response_chars": len(research_notes_md or ""),
+                    "validation_errors": list(validation_errors),
+                    "selected_chunk_ids": list(selected_chunk_ids),
+                })
+
+                if ok:
+                    break
+
+            topic_statuses[topic_id]["attempts"] = attempts_used
+            topic_statuses[topic_id]["selected_chunk_ids"] = list(selected_chunk_ids)
+            topic_statuses[topic_id]["grounding_ok"] = ok
+            topic_statuses[topic_id]["grounding_metrics"] = validation_metrics
+
+            write_json(topic_out_dir / "prompt_trace.json", prompt_trace)
+
+            research_notes_path = topic_out_dir / "research_notes.md"
+            final_notes_to_write = rewritten_md if cfg.grounding_mode == "soft" else (research_notes_md or "")
+            write_text(research_notes_path, final_notes_to_write)
+
+            grounding_report = {
+                "ok": ok,
+                "mode": cfg.grounding_mode,
+                "attempts": attempts_used,
+                "selected_chunk_ids": selected_chunk_ids,
+                "errors": validation_errors,
+                "metrics": validation_metrics,
+            }
+            write_json(topic_out_dir / "grounding_validation.json", grounding_report)
+
+            if not ok and cfg.grounding_mode == "strict":
+                err_txt = (
+                    "Grounding validation failed.\n\n"
+                    f"topic_id: {topic_id}\n"
+                    f"selected_chunk_ids: {selected_chunk_ids}\n"
+                    f"attempts: {attempts_used}\n\n"
+                    "Errors:\n"
+                    + "\n".join(f"- {e}" for e in validation_errors)
+                    + "\n"
+                )
+                write_text(topic_out_dir / "error.txt", err_txt)
+
+                topic_statuses[topic_id]["status"] = "failed"
+                topic_statuses[topic_id]["errors"].extend(validation_errors)
+                run_manifest["errors"].append({
+                    "topic_id": topic_id,
+                    "stage": "post_generation_grounding_validation",
+                    "errors": validation_errors,
+                })
+                continue
+
+            topic_statuses[topic_id]["status"] = "completed"
+            run_manifest["topics_completed"] += 1
+
+            completed_topics_payload.append({
+                "topic_id": topic_id,
+                "query": query,
+                "research_notes_markdown": final_notes_to_write,
+                "selected_chunk_ids": selected_chunk_ids,
+            })
 
         except Exception as e:
-            err_msg = str(e)
-            manifest["errors"].append({"topic_id": topic.id, "error": err_msg})
-            write_text(os.path.join(topic_dir, "error.txt"), err_msg)
+            msg = str(e)
+            write_text(topic_out_dir / "error.txt", msg + "\n")
+            topic_statuses[topic_id]["status"] = "failed"
+            topic_statuses[topic_id]["errors"].append(msg)
+            run_manifest["errors"].append({
+                "topic_id": topic_id,
+                "stage": "topic_generation",
+                "errors": [msg],
+            })
 
-    if manifest["topics_completed"] == 0:
-        manifest["errors"].append(
-            {"stage": "halt", "error": "No topics completed. Skipping synthesis and short-form to avoid misleading outputs."}
-        )
-        write_json(os.path.join(base_out, "run_manifest.json"), manifest)
-        return
+    run_manifest["topic_statuses"] = topic_statuses
+    run_manifest["ended_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
-    brief = ""
+    write_json(run_root / "run_manifest.json", run_manifest)
+
+    if run_manifest["topics_completed"] == 0 and cfg.halt_if_no_topics_completed:
+        return run_manifest
+
     try:
-        synth_prompt = build_grounded_synthesis_prompt(topic_notes_by_id)
-
-        write_json(
-            os.path.join(base_out, "tool_calls", "900_synthesize_grounded_notes_input.json"),
-            {"tool": "synthesize_grounded_notes", "input": {"topic_ids": list(topic_notes_by_id.keys())}},
-        )
-
-        brief = call_llm(model_name, synth_prompt)
-        manifest["call_count"] += 1
-
-        write_text(os.path.join(base_out, "summary", "brief.md"), brief)
-        write_json(os.path.join(base_out, "summary", "prompt_trace.json"), {"prompt": synth_prompt, "response": brief})
-
-        write_json(
-            os.path.join(base_out, "tool_calls", "900_synthesize_grounded_notes_output.json"),
-            {"tool": "synthesize_grounded_notes", "output": {"brief_path": os.path.join(base_out, "summary", "brief.md")}},
-        )
-
+        synthesis_prompt = build_grounded_synthesis_prompt(completed_topics_payload)
+        run_manifest["call_count"] += 1
+        summary_md = call_llm(synthesis_prompt, model=resolved_model)
+        write_text(summary_dir / "summary.md", summary_md)
     except Exception as e:
-        manifest["errors"].append({"stage": "synthesis", "error": str(e)})
+        run_manifest["errors"].append({
+            "topic_id": None,
+            "stage": "synthesis",
+            "errors": [str(e)],
+        })
+        write_json(run_root / "run_manifest.json", run_manifest)
+        return run_manifest
 
-    if brief and manifest["short_form_enabled"]:
-        for i, platform in enumerate(manifest["short_form_platforms"], start=1):
-            try:
-                sf_prompt = build_short_form_prompt(platform, brief)
+    try:
+        short_prompt = build_short_form_prompt(summary_md)
+        run_manifest["call_count"] += 1
+        short_md = call_llm(short_prompt, model=resolved_model)
+        write_text(short_form_dir / "short_form.md", short_md)
+    except Exception as e:
+        run_manifest["errors"].append({
+            "topic_id": None,
+            "stage": "short_form",
+            "errors": [str(e)],
+        })
+        write_json(run_root / "run_manifest.json", run_manifest)
+        return run_manifest
 
-                write_json(
-                    os.path.join(base_out, "tool_calls", f"950_generate_short_form_{i:02d}_input.json"),
-                    {"tool": "generate_short_form", "input": {"platform": platform}},
-                )
-
-                draft = call_llm(model_name, sf_prompt)
-                manifest["call_count"] += 1
-
-                out_path = os.path.join(base_out, "short_form", f"{platform}.md")
-                trace_path = os.path.join(base_out, "short_form", f"{platform}_prompt_trace.json")
-
-                write_text(out_path, draft)
-                write_json(trace_path, {"prompt": sf_prompt, "response": draft})
-
-                write_json(
-                    os.path.join(base_out, "tool_calls", f"950_generate_short_form_{i:02d}_output.json"),
-                    {"tool": "generate_short_form", "output": {"platform": platform, "path": out_path}},
-                )
-
-            except Exception as e:
-                manifest["errors"].append({"stage": "short_form", "platform": platform, "error": str(e)})
-
-    write_json(os.path.join(base_out, "run_manifest.json"), manifest)
-
-
-if __name__ == "__main__":
-    run_pipeline("inputs/run_config.json")
+    write_json(run_root / "run_manifest.json", run_manifest)
+    return run_manifest
