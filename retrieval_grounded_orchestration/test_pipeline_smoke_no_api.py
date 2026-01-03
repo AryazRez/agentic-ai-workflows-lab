@@ -32,7 +32,10 @@ def _fake_retrieve_evidence_for_topic(topic_id: str, query: str, manifest: dict,
 
 def _fake_validate_evidence_pack(manifest_path: Path):
     # Avoid dependency on the real repo evidence pack in smoke tests.
-    return {"pack_id": "evidence_pack_v1", "sources": [{"path": "docs/evidence_pack/sources/dummy.md", "tags": ["t1"]}]}
+    return {
+        "pack_id": "evidence_pack_v1",
+        "sources": [{"path": "docs/evidence_pack/sources/dummy.md", "tags": ["t1"]}],
+    }
 
 
 def test_smoke_strict_mode_passes_and_writes_artifacts(tmp_path, monkeypatch):
@@ -86,7 +89,7 @@ def test_smoke_strict_mode_fails_topic_and_halts_if_none_completed(tmp_path, mon
     monkeypatch.setattr(pl, "retrieve_evidence_for_topic", _fake_retrieve_evidence_for_topic)
 
     def fake_call_llm(prompt: str, *, model=None) -> str:
-        # Attempt 1 and Attempt 2 both invalid.
+        # All attempts are invalid (no citation and/or invalid citation).
         if "Write markdown with these sections" in prompt:
             return (
                 "# Research notes\n"
@@ -115,8 +118,8 @@ def test_smoke_strict_mode_fails_topic_and_halts_if_none_completed(tmp_path, mon
 
     assert manifest["topics_total"] == 1
     assert manifest["topics_completed"] == 0
-    # Now 2 calls because strict mode retries once on grounding failure.
-    assert manifest["call_count"] == 2
+    # Pipeline uses max_attempts=3 (initial + up to two retries) before failing the topic.
+    assert manifest["call_count"] == 3
     assert len(manifest["errors"]) == 1
     assert manifest["errors"][0]["stage"] == "post_generation_grounding_validation"
 
@@ -206,7 +209,7 @@ def test_smoke_soft_mode_prefixes_unverified_and_continues(tmp_path, monkeypatch
     manifest = pl.run_pipeline(run_id="smoke_soft", config=cfg, topics=topics, outputs_dir=tmp_path)
 
     assert manifest["topics_completed"] == 1
-    assert manifest["call_count"] >= 2
+    assert manifest["call_count"] == 3
 
     notes_path = tmp_path / "smoke_soft" / "topics" / "t1" / "research_notes.md"
     notes = notes_path.read_text(encoding="utf-8")
